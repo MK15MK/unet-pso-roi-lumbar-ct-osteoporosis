@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "U-Net and PSO-guided ROI selection for lumbar CT osteoporosis classification"
+type: software
+authors:
+  - family-names: "Kumar S"
+    given-names: "Manoj"
+repository-code: "https://github.com/MK15MK/unet-pso-roi-lumbar-ct-osteoporosis"
+license: MIT
+keywords:
+  - osteoporosis
+  - lumbar spine CT
+  - region of interest
+  - U-Net
+  - particle swarm optimization
