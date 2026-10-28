@@ -27,11 +27,15 @@ whale optimization, marine predators, vision transformer, opportunistic screenin
    (equal weights) and outputs a per-slice bone-probability map.
 3. **ROI policy.** The crop centre is the centre of mass of pixels above a threshold inside a fixed
    central window; the policy vector (threshold, crop size, two shifts) is decoded to bounded ranges.
-4. **Search.** PSO, WOA and MPA tune the policy with an equal evaluation budget. Fitness is
-   1 - validation macro-F1 of a quick proxy classifier trained on a slice subsample.
+4. **Search.** PSO, WOA and MPA tune the policy with an equal evaluation budget (default 10 particles
+   x 5 iterations, i.e. n(T+1) proxy trainings per fold). Fitness is 1 - patient-level validation
+   macro-F1 of a quick proxy classifier trained on a slice subsample.
 5. **Classifier.** ResNet-18 features form a token grid read by a two-layer transformer; clinical
-   variables are fused through a small MLP. Slice probabilities are averaged per patient.
-6. **Protocol.** Patient-level, label-stratified folds; the test fold is scored once; BMD, T-score
+   variables (age, height, weight, BMI, gender, ethnicity) are fused through a small MLP. Numeric
+   variables are imputed and standardised, and categories are one-hot encoded using training
+   patients only; unseen or rare categories encode as all zeros. Slice probabilities are averaged per patient.
+6. **Protocol.** Patient-level, label-stratified five-fold cross-validation; every patient is in the
+   test fold exactly once and the per-patient test predictions are pooled over the five folds; BMD, T-score
    and Z-score columns are refused as input features to prevent label leakage.
 
 ## III. Repository layout
@@ -39,6 +43,7 @@ whale optimization, marine predators, vision transformer, opportunistic screenin
 | Path | Purpose |
 |---|---|
 | `src/roi_compare.py` | Main pipeline: data loading, U-Net, ROI optimizers, ViT-CNN, cross-validation |
+| `src/pool_results.py` | Pools per-fold predictions: pooled metrics with patient-level bootstrap CIs, per-fold metrics, paired differences, permutation p-values (Holm-adjusted), confusion matrices |
 | `src/roi_explain.py` | Figures explaining the masking and ROI parameters on axial CT slices |
 | `src/roi_single.py` | One axial slice, all ROI strategies (no training) |
 | `src/roi_axial.py`, `src/roi_ap.py` | Same-slice ROI comparison panels for axial CT and AP radiographs |
@@ -62,7 +67,9 @@ Obtain LUMOS from its authors' release [1] and point the scripts at it:
 ```bash
 export LUMOS_DIR=/path/to/LUMOS     # folder with lumos_ct_*_dcm, lumos_x_*_dcm and the clinical xlsx
 export OUT_DIR=outputs
-python src/roi_compare.py --help
+python src/roi_compare.py           # all five folds, then pooled metrics (tag p10i5_clin)
+python src/roi_compare.py --fold 0  # a single fold
+python src/pool_results.py --tag p10i5_clin   # re-pool saved predictions
 python src/roi_single.py            # one-slice ROI comparison, no training
 python src/roi_axial.py             # axial CT panel figure
 ```
@@ -70,6 +77,15 @@ python src/roi_axial.py             # axial CT panel figure
 `mask_compare.py` and `mask_validation.py` read TotalSegmentator [8] output under
 `$OUT_DIR`; run the TotalSegmentator CLI on a patient's DICOM folder first
 (for example `TotalSegmentator -i <dicom_dir> -o $OUT_DIR/ts_out/p1 --task total --fast`).
+
+## Outputs
+
+For each method and fold, `pred_<tag>_<method>_fold<k>.csv` holds one row per test patient
+(`patient_id, fold, true_label, p_normal, p_osteopenia, p_osteoporosis`). `pool_results.py` writes
+`pooled_metrics_<tag>.csv`, `per_fold_metrics_<tag>.csv`, `class_counts_per_fold_<tag>.csv`,
+`confusion_matrices_<tag>.json` and `paired_vs_unsegmented_<tag>.csv`. The tag encodes the swarm
+size, iterations and whether clinical inputs were used, so runs with different settings never reuse
+each other's cached searches.
 
 ## VI. Data availability and ethics
 

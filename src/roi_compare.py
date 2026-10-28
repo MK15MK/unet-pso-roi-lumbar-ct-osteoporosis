@@ -34,7 +34,11 @@ METHODS = ["unsegmented", "rule_centroid", "unet_default", "pso_roi", "woa_roi",
 COLORS = {"unsegmented": "#888888", "rule_centroid": "#1f77b4", "unet_default": "#ff7f0e", "pso_roi": "#2ca02c",
           "woa_roi": "#d62728", "mpa_roi": "#9467bd"}
 DEFAULT_ROI = dict(tau=0.5, side=0.55, dx=0.0, dy=0.0)
-CLIN_TABLE, CLIN_NAMES = {}, []
+CLIN_DF, CLIN_NAMES = None, []
+CLIN_NUM = ["age", "height", "weight", "BMI"]
+CLIN_CAT = ["gender", "ethnicity"]
+CLIN_RARE_MIN = 5
+FORBIDDEN_CLIN = ("bmd", "t_score", "z_score", "t-score", "z-score", "tscore", "zscore")
 
 
 def require_gpu():
@@ -124,39 +128,90 @@ def load_slices(args):
     def work(pid):
         return pid, [slice_to_u8(p) for p in pick_central(ct[pid])]
 
-    imgs, ys, ids, seen = [], [], [], set()
+    imgs, ys, ids, seen, cross = [], [], [], {}, 0
     done = 0
     with ThreadPoolExecutor(max_workers=6) as ex:
         for pid, arrs in ex.map(work, pids):
             for a in arrs:
                 h = hashlib.sha1(a.tobytes()).hexdigest()
                 if h in seen:
+                    if seen[h] != pid:
+                        cross += 1
                     continue
-                seen.add(h)
+                seen[h] = pid
                 imgs.append(a)
                 ys.append(labels[pid])
                 ids.append(pid)
             done += 1
             if done % 20 == 0 or done == len(pids):
                 print(f"  read {done}/{len(pids)} patients ({len(imgs)} unique slices)", flush=True)
+    print(f"slices dropped as exact duplicates of a slice from another patient: {cross}", flush=True)
     X = np.stack(imgs)
     y, ids = np.array(ys), np.array(ids)
     np.savez(cache, X=X, y=y, pids=ids)
     return X, y, ids
 
 
+def _find_col(df, name):
+    for c in df.columns:
+        if str(c).strip().lower() == name.lower():
+            return c
+    raise KeyError(f"clinical column '{name}' not found; columns: {[str(c) for c in df.columns][:60]}")
+
+
 def load_clinical(args, used):
-    global CLIN_TABLE, CLIN_NAMES
+    global CLIN_DF
     df, _ = read_labels(args.data_dir)
-    cols = ["age", "gender", "height", "weight", "BMI"]
-    sub = df[["patient_id"] + cols].copy()
-    sub["_pid"] = sub["patient_id"].astype(str).str.extract(r"(\d+)")[0].astype(float)
-    sub = sub.dropna(subset=["_pid"]).drop_duplicates("_pid").set_index(sub["_pid"].astype(int))
-    enc = pd.get_dummies(sub[cols], drop_first=True, dtype=float)
-    enc = enc.loc[:, enc.std(skipna=True) > 0]
-    CLIN_NAMES = list(enc.columns)
-    CLIN_TABLE = {int(p): enc.loc[p].to_numpy(dtype=float) for p in used}
-    print(f"clinical input: {CLIN_NAMES}", flush=True)
+    cols = {n: _find_col(df, n) for n in CLIN_NUM + CLIN_CAT}
+    bad = [str(c) for c in cols.values() if any(f in str(c).lower() for f in FORBIDDEN_CLIN)]
+    if bad:
+        raise ValueError(f"refusing label-defining clinical columns: {bad}")
+    sub = pd.DataFrame({n: df[c] for n, c in cols.items()})
+    sub["_pid"] = df[_find_col(df, "patient_id")].astype(str).str.extract(r"(\d+)")[0]
+    sub = sub.dropna(subset=["_pid"])
+    sub["_pid"] = sub["_pid"].astype(int)
+    sub = sub.drop_duplicates("_pid").set_index("_pid")
+    for c in CLIN_NUM:
+        sub[c] = pd.to_numeric(sub[c], errors="coerce")
+    for c in CLIN_CAT:
+        sub[c] = sub[c].astype(str).str.strip().str.lower().replace({"nan": "unknown", "": "unknown", "none": "unknown"})
+    CLIN_DF = sub.reindex(list(used))
+    for c in CLIN_CAT:
+        CLIN_DF[c] = CLIN_DF[c].fillna("unknown")
+    print("clinical inputs: numeric", CLIN_NUM, "categorical", CLIN_CAT, flush=True)
+    print("missing numeric values:", CLIN_DF[CLIN_NUM].isna().sum().to_dict(), flush=True)
+    for c in CLIN_CAT:
+        print(f"{c} categories:", CLIN_DF[c].value_counts().to_dict(), flush=True)
+
+
+def clinical_encoder(train_pids):
+    global CLIN_NAMES
+    df = CLIN_DF
+    tr = df.loc[list(train_pids)]
+    num = tr[CLIN_NUM].to_numpy(dtype=float)
+    med = np.nanmedian(num, 0)
+    med = np.where(np.isnan(med), 0.0, med)
+    filled = np.where(np.isnan(num), med, num)
+    mu, sd = filled.mean(0), filled.std(0)
+    sd[sd < 1e-8] = 1.0
+    cats = {}
+    for c in CLIN_CAT:
+        vc = tr[c].value_counts()
+        keep = sorted(k for k, n in vc.items() if n >= CLIN_RARE_MIN and k != "unknown")
+        cats[c] = keep if len(keep) >= 2 else []
+    CLIN_NAMES = CLIN_NUM + [f"{c}={k}" for c in CLIN_CAT for k in cats[c]]
+
+    def enc(ps):
+        sub = df.loc[list(ps)]
+        A = sub[CLIN_NUM].to_numpy(dtype=float)
+        A = np.where(np.isnan(A), med, A)
+        A = np.clip((A - mu) / sd, -5, 5)
+        parts = [A]
+        for c in CLIN_CAT:
+            col = sub[c].to_numpy()
+            parts.append(np.stack([(col == k).astype(float) for k in cats[c]], 1) if cats[c] else np.zeros((len(col), 0)))
+        return np.concatenate(parts, 1).astype(np.float32)
+    return enc
 
 
 def make_fold(pids, y, k, folds, seed):
@@ -181,16 +236,11 @@ def build_fold(X, y, pids, parts):
         out["X" + name] = torch.from_numpy(X[idx])[:, None]
         out["y" + name] = torch.from_numpy(y[idx]).long().to(DEV)
         out["p" + name] = pids[idx]
-    if CLIN_TABLE:
-        M = np.stack([CLIN_TABLE[int(p)] for p in tr]).astype(np.float64)
-        med = np.nanmedian(M, 0)
-        M = np.where(np.isnan(M), med, M)
-        mu, sd = M.mean(0), M.std(0)
-        sd[sd < 1e-8] = 1.0
+    if CLIN_DF is not None:
+        enc = clinical_encoder(tr)
         for name in ("tr", "va", "te"):
-            A = np.stack([CLIN_TABLE[int(p)] for p in out["p" + name]]).astype(np.float64)
-            A = np.where(np.isnan(A), med, A)
-            out["C" + name] = torch.from_numpy(((A - mu) / sd).astype(np.float32)).to(DEV)
+            out["C" + name] = torch.from_numpy(enc(out["p" + name])).to(DEV)
+        print(f"clinical vector length: {len(CLIN_NAMES)} -> {CLIN_NAMES}", flush=True)
     print(f"fold sizes: train={len(out['ytr'])} ({len(tr)} pts) val={len(out['yva'])} ({len(va)} pts) "
           f"test={len(out['yte'])} ({len(te)} pts)", flush=True)
     return out
@@ -573,6 +623,7 @@ def run_search(name, fold, P, args, out_path):
     ytr_s, yva_s = fold["ytr"][torch.from_numpy(itr).to(DEV)], fold["yva"][torch.from_numpy(iva).to(DEV)]
     Ctr_s = fold["Ctr"][torch.from_numpy(itr).to(DEV)] if "Ctr" in fold else None
     Cva_s = fold["Cva"][torch.from_numpy(iva).to(DEV)] if "Cva" in fold else None
+    pva_s = fold["pva"][iva]
     cache, log = {}, []
 
     def fitness(v):
@@ -585,8 +636,8 @@ def run_search(name, fold, P, args, out_path):
             data["Ctr"], data["Cva"] = Ctr_s, Cva_s
         model, _, _ = train_classifier(data, args.proxy_epochs, args, args.seed, quiet=True)
         lv = forward_logits(model, data["Xva"], data.get("Cva"))
-        pr = lv.argmax(1).cpu().numpy()
-        f1 = f1_score(yva_s.cpu().numpy(), pr, average="macro", zero_division=0)
+        _, yy, pp = patient_pool(torch.softmax(lv, 1).cpu().numpy(), yva_s.cpu().numpy(), pva_s)
+        f1 = f1_score(yy, pp.argmax(1), average="macro", zero_division=0)
         del model, data
         torch.cuda.empty_cache()
         cache[key] = 1.0 - f1
@@ -597,7 +648,7 @@ def run_search(name, fold, P, args, out_path):
     rng = np.random.default_rng(args.seed + 5)
     best_v, best_f = OPTIMIZERS[name](fitness, 4, args.pop, args.iters, rng)
     res = {"method": name, "roi": {a: float(b) for a, b in decode_roi(best_v).items()}, "best_val_f1": 1.0 - float(best_f),
-           "evaluations": len(log), "log": log}
+           "evaluations": len(log), "pop": args.pop, "iters": args.iters, "log": log}
     json.dump(res, open(out_path, "w"), indent=2)
     return res
 
@@ -643,18 +694,72 @@ def draw_figure(fold_data, P_test, params, args, path, title_methods):
     plt.close(fig)
 
 
+def run_fold(args, k, X, y, pids, methods, tag):
+    parts = make_fold(pids, y, k, args.folds, args.seed)
+    fold = build_fold(X, y, pids, parts)
+    for c in ("Ctr", "Cva", "Cte"):
+        if c in fold:
+            fold[c] = fold[c].to(DEV)
+    net = train_unet(fold, args, os.path.join(args.out_dir, f"unet_fold{k}.pt"))
+    P = {s: unet_probs(net, fold["X" + s]) for s in ("tr", "va", "te")}
+    del net
+    torch.cuda.empty_cache()
+
+    params = {"unsegmented": {}, "rule_centroid": dict(DEFAULT_ROI), "unet_default": dict(DEFAULT_ROI)}
+    for name in OPTIMIZERS:
+        if name in methods:
+            print(f"\n=== fold {k} search: {name} (pop {args.pop}, iters {args.iters}) ===", flush=True)
+            res = run_search(name, fold, P, args, os.path.join(args.out_dir, f"search_{tag}_{name}_fold{k}.json"))
+            params[name] = res["roi"]
+    for name in OPTIMIZERS:
+        params.setdefault(name, dict(DEFAULT_ROI))
+    draw_figure(fold, P["te"], params, args, os.path.join(args.out_dir, f"roi_same_slice_comparison_{tag}_fold{k}.png"), methods)
+    json.dump(params, open(os.path.join(args.out_dir, f"roi_parameters_{tag}_fold{k}.json"), "w"), indent=2)
+    if args.figure_only:
+        return
+
+    for m in methods:
+        pred_path = os.path.join(args.out_dir, f"pred_{tag}_{m}_fold{k}.csv")
+        if os.path.exists(pred_path):
+            print(f"fold {k}: predictions for {m} already exist, skipping", flush=True)
+            continue
+        print(f"\n=== fold {k} final ViT-CNN: {m} ({args.final_epochs} epochs) ===", flush=True)
+        t0 = time.time()
+        kind = {"unsegmented": "unsegmented", "rule_centroid": "rule"}.get(m, "unet")
+        data = {"Xtr": make_crops(kind, fold["Xtr"], P["tr"], params[m]), "ytr": fold["ytr"],
+                "Xva": make_crops(kind, fold["Xva"], P["va"], params[m]), "yva": fold["yva"]}
+        xte = make_crops(kind, fold["Xte"], P["te"], params[m])
+        for c in ("Ctr", "Cva"):
+            if c in fold:
+                data[c] = fold[c]
+        model, best_ep, best_loss = train_classifier(data, args.final_epochs, args, args.seed)
+        lt = forward_logits(model, xte, fold.get("Cte"))
+        probs = torch.softmax(lt, 1).cpu().numpy()
+        uniq, yy, pp = patient_pool(probs, fold["yte"].cpu().numpy(), fold["pte"])
+        pd.DataFrame({"patient_id": uniq, "fold": k, "true_label": yy, "p_normal": pp[:, 0], "p_osteopenia": pp[:, 1],
+                      "p_osteoporosis": pp[:, 2]}).to_csv(pred_path, index=False)
+        json.dump({"method": m, "fold": k, "best_epoch": best_ep, "best_val_loss": best_loss,
+                   "minutes": round((time.time() - t0) / 60, 1), "roi": params[m]},
+                  open(os.path.join(args.out_dir, f"meta_{tag}_{m}_fold{k}.json"), "w"), indent=2)
+        met = class_metrics(yy, pp)
+        print(f"  fold {k} patient-level test: macro-F1={met['f1_macro']:.4f} acc={met['accuracy']:.4f} auc={met['auc_ovr_macro']:.4f}", flush=True)
+        del data, xte, model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", default=os.environ.get("LUMOS_DIR", "data/LUMOS"))
     ap.add_argument("--out_dir", default=os.environ.get("OUT_DIR", "outputs"))
-    ap.add_argument("--fold", type=int, default=0)
+    ap.add_argument("--fold", type=int, default=-1, help="-1 runs every fold and pools the test predictions")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--unet_epochs", type=int, default=10)
     ap.add_argument("--final_epochs", type=int, default=30)
-    ap.add_argument("--pop", type=int, default=6)
-    ap.add_argument("--iters", type=int, default=3)
+    ap.add_argument("--pop", type=int, default=10)
+    ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--proxy_epochs", type=int, default=4)
     ap.add_argument("--proxy_train_stride", type=int, default=4)
     ap.add_argument("--proxy_val_stride", type=int, default=2)
@@ -672,11 +777,13 @@ def main():
         args.unet_epochs, args.final_epochs, args.pop, args.iters, args.proxy_epochs = 1, 1, 2, 1, 1
         args.proxy_train_stride = args.proxy_val_stride = 1
         args.out_dir = os.path.join(args.out_dir, "smoke")
+        args.fold = 0
     if args.quick:
         args.subset_patients, args.figure_only = 90, True
         args.unet_epochs, args.pop, args.iters = 6, 4, 2
         args.proxy_epochs, args.proxy_train_stride, args.proxy_val_stride = 2, 2, 1
         args.out_dir = os.path.join(args.out_dir, "quick")
+        args.fold = 0
     os.makedirs(args.out_dir, exist_ok=True)
     require_gpu()
     X, y, pids = load_slices(args)
@@ -684,68 +791,15 @@ def main():
         X, y, pids = X[::15], y[::15], pids[::15]
     if args.clinical:
         load_clinical(args, sorted(set(int(p) for p in pids.tolist())))
-    parts = make_fold(pids, y, args.fold, args.folds, args.seed)
-    fold = build_fold(X, y, pids, parts)
-    for k in ("Ctr", "Cva", "Cte"):
-        if k in fold:
-            fold[k] = fold[k].to(DEV)
-    net = train_unet(fold, args, os.path.join(args.out_dir, f"unet_fold{args.fold}.pt"))
-    P = {s: unet_probs(net, fold["X" + s]) for s in ("tr", "va", "te")}
-    del net
-    torch.cuda.empty_cache()
-
     methods = [m for m in args.methods.split(",") if m]
-    params = {"unsegmented": {}, "rule_centroid": dict(DEFAULT_ROI), "unet_default": dict(DEFAULT_ROI)}
-    searches = {}
-    for name in OPTIMIZERS:
-        if name in methods:
-            print(f"\n=== search: {name} (pop {args.pop}, iters {args.iters}) ===", flush=True)
-            searches[name] = run_search(name, fold, P, args, os.path.join(args.out_dir, f"search_{name}_fold{args.fold}.json"))
-            params[name] = searches[name]["roi"]
-    for name in OPTIMIZERS:
-        params.setdefault(name, dict(DEFAULT_ROI))
-    draw_figure(fold, P["te"], params, args, os.path.join(args.out_dir, f"roi_same_slice_comparison_fold{args.fold}.png"), methods)
-    print("saved the same-slice comparison figure", flush=True)
-    json.dump(params, open(os.path.join(args.out_dir, f"roi_parameters_fold{args.fold}.json"), "w"), indent=2)
-    if args.figure_only:
-        return
-
-    rows = []
-    for m in methods:
-        res_path = os.path.join(args.out_dir, f"result_{m}_fold{args.fold}.json")
-        if os.path.exists(res_path):
-            rows.append(json.load(open(res_path)))
-            print(f"loaded result for {m}", flush=True)
-            continue
-        print(f"\n=== final ViT-CNN: {m} ({args.final_epochs} epochs) ===", flush=True)
-        t0 = time.time()
-        kind = {"unsegmented": "unsegmented", "rule_centroid": "rule"}.get(m, "unet")
-        data = {"Xtr": make_crops(kind, fold["Xtr"], P["tr"], params[m]), "ytr": fold["ytr"],
-                "Xva": make_crops(kind, fold["Xva"], P["va"], params[m]), "yva": fold["yva"]}
-        xte = make_crops(kind, fold["Xte"], P["te"], params[m])
-        for k in ("Ctr", "Cva"):
-            if k in fold:
-                data[k] = fold[k]
-        model, best_ep, best_loss = train_classifier(data, args.final_epochs, args, args.seed)
-        lt = forward_logits(model, xte, fold.get("Cte"))
-        probs = torch.softmax(lt, 1).cpu().numpy()
-        _, yy, pp = patient_pool(probs, fold["yte"].cpu().numpy(), fold["pte"])
-        met = class_metrics(yy, pp)
-        row = {"method": m, "best_epoch": best_ep, "best_val_loss": best_loss, "minutes": round((time.time() - t0) / 60, 1),
-               "roi": params[m], **{k: float(v) for k, v in met.items()}}
-        json.dump(row, open(res_path, "w"), indent=2)
-        rows.append(row)
-        print(f"  patient-level test: macro-F1={met['f1_macro']:.4f} acc={met['accuracy']:.4f} auc={met['auc_ovr_macro']:.4f}", flush=True)
-        del data, xte, model
-        gc.collect()
-        torch.cuda.empty_cache()
-        flat = [{k: v for k, v in r.items() if k != "roi"} for r in rows]
-        pd.DataFrame(flat).to_csv(os.path.join(args.out_dir, f"roi_comparison_fold{args.fold}.csv"), index=False)
-    flat = [{k: v for k, v in r.items() if k != "roi"} for r in rows]
-    df = pd.DataFrame(flat)
-    df.to_csv(os.path.join(args.out_dir, f"roi_comparison_fold{args.fold}.csv"), index=False)
-    print("\n" + df[["method", "accuracy", "f1_macro", "balanced_accuracy", "auc_ovr_macro", "mcc", "cohen_kappa", "brier_score"]]
-          .round(4).to_string(index=False), flush=True)
+    tag = f"p{args.pop}i{args.iters}_{'clin' if args.clinical else 'img'}"
+    folds_to_run = list(range(args.folds)) if args.fold < 0 else [args.fold]
+    for k in folds_to_run:
+        print(f"\n######## fold {k + 1}/{args.folds} ########", flush=True)
+        run_fold(args, k, X, y, pids, methods, tag)
+    if not args.figure_only and len(folds_to_run) == args.folds:
+        from pool_results import pool
+        pool(args.out_dir, tag, methods, reference="unsegmented")
 
 
 if __name__ == "__main__":
